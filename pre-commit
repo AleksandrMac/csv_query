@@ -1,0 +1,11 @@
+#!/bin/sh
+MAKE="mingw32-make.exe"
+HOME_DIR=$(pwd)
+csv_query=$(pwd)"/Go/go_best_practice/csv_query"
+run_make_test=$MAKE" test check"
+cd $csv_query
+exec $run_make_test
+exit_code=$?
+
+echo exit_code
+exit exit_code

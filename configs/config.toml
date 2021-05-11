@@ -1,0 +1,29 @@
+sep = ","
+timeOut = 3
+outputPaths = ["logs/access.log"]
+errorOutputPaths = ["logs/error.log"]
+
+[head]
+path = "test/data/owid-covid-data.csv"
+# type [bool, int, float, string, date]
+# fields = [
+#    {name = "first_name", type = "string"},
+#   {name = "date", type = "date"}
+#   ]
+
+# [log]
+# level = "debug"
+# development = true
+# disableCaller = false
+# DisableStacktrace = false
+# encoding = "console"
+# outputPaths = 
+# 
+# initialFields = {
+#     foo = "bar"
+#     }
+# encoderConfig = {
+#     messageKey = "message",
+# 	levelKey = "level",
+# 	levelEncoder = "capital"
+#     }
