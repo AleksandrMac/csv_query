@@ -1,5 +1,5 @@
 sep = ","
-timeOut = 3
+timeOut = 30
 outputPaths = ["logs/access.log"]
 errorOutputPaths = ["logs/error.log"]
 

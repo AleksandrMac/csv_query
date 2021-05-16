@@ -32,6 +32,12 @@ var (
 	GitHashCommit string
 )
 
+type OutMessage struct {
+	Err chan error
+	Inf chan string
+	Row chan string
+}
+
 func main() {
 	fs := afero.NewOsFs()
 	buf, err := afero.ReadFile(fs, "configs/config.toml")
@@ -43,8 +49,27 @@ func main() {
 		panic(fmt.Errorf("configuration error: %w", err).Error())
 	}
 	logConf := zap.NewProductionConfig()
-	logConf.OutputPaths = config.OutputPaths
-	logConf.ErrorOutputPaths = config.ErrorOutputPaths
+	for _, path := range func() []string {
+		paths := make([]string, 0, len(config.OutputPaths)+len(config.ErrorOutputPaths))
+		paths = append(paths, config.OutputPaths...)
+		return append(paths, config.ErrorOutputPaths...)
+	}() {
+		_, err := fs.Stat(path)
+		if err != nil {
+			file, err := fs.Create(path)
+			defer file.Close()
+			if err != nil {
+				panic(err.Error())
+			}
+		}
+	}
+
+	if len(config.OutputPaths) > 0 {
+		logConf.OutputPaths = config.OutputPaths
+	}
+	if len(config.ErrorOutputPaths) > 0 {
+		logConf.ErrorOutputPaths = config.ErrorOutputPaths
+	}
 	logger, err := logConf.Build()
 	if err != nil {
 		panic(err)
@@ -66,17 +91,21 @@ func main() {
 
 	ctxMain, cancelMain := context.WithCancel(context.Background())
 	defer cancelMain()
-	errors := make(chan error)
-	go watchSignals(cancelMain, errors)
+	outMessage := OutMessage{
+		Err: make(chan error),
+		Inf: make(chan string),
+	}
+	// errors := make(chan error)
+	// outMessages := make(chan string)
+	go watchSignals(cancelMain, outMessage)
 	go func() {
 		var wg sync.WaitGroup
 		for {
 			ctx, cancel := context.WithTimeout(ctxMain, config.TimeOut*time.Second)
-			lines := make(chan string)
 			//nolint:gomnd
 			wg.Add(2)
-			go fileReader(ctx, cancel, config.Head.Path, lines, errors, &wg)
-			go linesMatcher(ctx, &config, lines, errors, &wg)
+			go fileReader(ctx, cancel, config.Head.Path, &outMessage, &wg)
+			go linesMatcher(ctx, &config, &outMessage, &wg)
 			wg.Wait()
 		}
 	}()
@@ -84,30 +113,33 @@ func main() {
 		select {
 		case <-ctxMain.Done():
 			return
-		case err := <-errors:
+		case err := <-outMessage.Err:
 			logger.Error(err.Error())
+		case message := <-outMessage.Inf:
+			logger.Info(message)
 		}
 	}
 }
 
-func watchSignals(cancel context.CancelFunc, errCh chan error) {
+func watchSignals(cancel context.CancelFunc, outMessage OutMessage) {
 	osSignalChan := make(chan os.Signal, 1)
 
 	signal.Notify(osSignalChan,
 		syscall.SIGINT)
 	sig := <-osSignalChan
-	errCh <- fmt.Errorf("got signal %q", sig.String())
+	outMessage.Err <- fmt.Errorf("got signal %q", sig.String())
 
 	// если сигнал получен, отменяем контекст работы
 	cancel()
 }
 
-func fileReader(ctx context.Context, cancel context.CancelFunc, path string, lineCh chan string, errCh chan error, wg *sync.WaitGroup) {
+func fileReader(ctx context.Context, cancel context.CancelFunc, path string, outMessage *OutMessage, wg *sync.WaitGroup) {
 	defer wg.Done()
-	defer close(lineCh)
+	outMessage.Row = make(chan string)
+	defer close(outMessage.Row)
 	file, err := os.Open(path)
 	if err != nil {
-		errCh <- fmt.Errorf("file open error: %w", err)
+		outMessage.Err <- fmt.Errorf("file open error: %w", err)
 		cancel()
 		return
 	}
@@ -119,12 +151,12 @@ func fileReader(ctx context.Context, cancel context.CancelFunc, path string, lin
 		case <-ctx.Done():
 			return
 		default:
-			lineCh <- reader.Text()
+			outMessage.Row <- reader.Text()
 		}
 	}
 }
 
-func linesMatcher(ctx context.Context, config *Config, lineCh chan string, errCh chan error, wg *sync.WaitGroup) {
+func linesMatcher(ctx context.Context, config *Config, outMessage *OutMessage, wg *sync.WaitGroup) {
 	defer wg.Done()
 	sc := bufio.NewScanner(os.Stdin)
 
@@ -141,25 +173,26 @@ func linesMatcher(ctx context.Context, config *Config, lineCh chan string, errCh
 
 		switch answer {
 		case "Y", "y":
-			var str string = <-lineCh
+			var str string = <-outMessage.Row
 			config.Head.Fields = csv.GetFields(str, config.Sep)
+			fmt.Println(str)
 		default:
 			return
 		}
 	}
 	fmt.Print("csv_query>> ")
 
-	var query string
+	var query string = "continent='Asia' and date='2020-04-14'"
 	if sc.Scan() {
 		query = sc.Text()
-		config.Head.Log.Info(query)
+		outMessage.Inf <- query
 	}
 	var wgInside sync.WaitGroup
 
-	for val := range lineCh {
+	for val := range outMessage.Row {
 		select {
 		case <-ctx.Done():
-			errCh <- ctx.Err()
+			outMessage.Err <- ctx.Err()
 			return
 		default:
 			wgInside.Add(1)
