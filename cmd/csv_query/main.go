@@ -49,19 +49,9 @@ func main() {
 		panic(fmt.Errorf("configuration error: %w", err).Error())
 	}
 	logConf := zap.NewProductionConfig()
-	for _, path := range func() []string {
-		paths := make([]string, 0, len(config.OutputPaths)+len(config.ErrorOutputPaths))
-		paths = append(paths, config.OutputPaths...)
-		return append(paths, config.ErrorOutputPaths...)
-	}() {
-		_, err := fs.Stat(path)
-		if err != nil {
-			file, err := fs.Create(path)
-			defer file.Close()
-			if err != nil {
-				panic(err.Error())
-			}
-		}
+
+	if err = pathMatch(&config, fs); err != nil {
+		panic(err)
 	}
 
 	if len(config.OutputPaths) > 0 {
@@ -95,8 +85,7 @@ func main() {
 		Err: make(chan error),
 		Inf: make(chan string),
 	}
-	// errors := make(chan error)
-	// outMessages := make(chan string)
+
 	go watchSignals(cancelMain, outMessage)
 	go func() {
 		var wg sync.WaitGroup
@@ -209,6 +198,24 @@ func linesMatcher(ctx context.Context, config *Config, outMessage *OutMessage, w
 		}
 	}
 	wgInside.Wait()
+}
+
+func pathMatch(config *Config, fs afero.Fs) error {
+	for _, path := range func() []string {
+		paths := make([]string, 0, len(config.OutputPaths)+len(config.ErrorOutputPaths))
+		paths = append(paths, config.OutputPaths...)
+		return append(paths, config.ErrorOutputPaths...)
+	}() {
+		_, err := fs.Stat(path)
+		if err != nil {
+			var file afero.File
+			file, err = fs.Create(path)
+			if err != nil {
+				return fmt.Errorf("%v: %w", err.Error(), file.Close())
+			}
+		}
+	}
+	return nil
 }
 
 // export GIT_COMMIT=$(git rev-list -1 HEAD) && \ go build -ldflags "-X main.GitCommit=$GIT_COMMIT"
