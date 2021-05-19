@@ -12,17 +12,19 @@ import (
 	"time"
 
 	"github.com/AleksandrMac/csv_query/pkg/csv"
+	"github.com/AleksandrMac/csv_query/pkg/log"
 	toml "github.com/pelletier/go-toml"
 	"github.com/spf13/afero"
 	"go.uber.org/zap"
 )
 
 type Config struct {
-	Head             csv.Head      `json:"head" yaml:"head"`
-	Sep              string        `json:"sep" yaml:"sep"`
-	TimeOut          time.Duration `json:"timeOut" yaml:"timeOut"`
-	OutputPaths      []string      `json:"outputPaths" yaml:"outputPaths"`
-	ErrorOutputPaths []string      `json:"errorOutputPaths" yaml:"errorOutputPaths"`
+	Head    csv.Head      `json:"head" yaml:"head"`
+	Sep     string        `json:"sep" yaml:"sep"`
+	TimeOut time.Duration `json:"timeOut" yaml:"timeOut"`
+	Log     log.Config    `json:"log" yaml:"log"`
+	// OutputPaths      []string `json:"outputPaths" yaml:"outputPaths"`
+	// ErrorOutputPaths []string `json:"errorOutputPaths" yaml:"errorOutputPaths"`
 	// Log     zap.Config    `json:"log" yaml:"log"`
 }
 
@@ -39,42 +41,36 @@ type OutMessage struct {
 }
 
 func main() {
+	var (
+		err    error
+		buf    []byte
+		logger *zap.Logger
+		path   string
+	)
+
 	fs := afero.NewOsFs()
-	buf, err := afero.ReadFile(fs, "configs/config.toml")
-	if err != nil {
+
+	if buf, err = afero.ReadFile(fs, "configs/config.toml"); err != nil {
 		panic(fmt.Errorf("configuration error: %w", err).Error())
 	}
-	err = toml.Unmarshal(buf, &config)
-	if err != nil {
+	if err = toml.Unmarshal(buf, &config); err != nil {
 		panic(fmt.Errorf("configuration error: %w", err).Error())
 	}
-	logConf := zap.NewProductionConfig()
 
-	if err = pathMatch(&config, fs); err != nil {
-		panic(err)
-	}
-
-	if len(config.OutputPaths) > 0 {
-		logConf.OutputPaths = config.OutputPaths
-	}
-	if len(config.ErrorOutputPaths) > 0 {
-		logConf.ErrorOutputPaths = config.ErrorOutputPaths
-	}
-	logger, err := logConf.Build()
-	if err != nil {
-		panic(err)
+	if logger, err = log.New(config.Log); err != nil {
+		panic(fmt.Errorf("logger created error: %w", err).Error())
 	}
 	defer func() {
-		if err1 := logger.Sync(); err1 != nil {
-			fmt.Println(err)
+		if errLog := logger.Sync(); errLog != nil {
+			fmt.Println(errLog)
 			return
 		}
 	}()
 
-	path, err := os.Getwd()
-	if err != nil {
+	if path, err = os.Getwd(); err != nil {
 		logger.Fatal(err.Error())
 	}
+
 	fmt.Println("Working directory: ", path)
 	fmt.Println("GitCommit: ", GitCommit)
 	fmt.Println("GitHashCommit: ", GitHashCommit)
@@ -88,14 +84,14 @@ func main() {
 
 	go watchSignals(cancelMain, outMessage)
 	go func() {
-		var wg sync.WaitGroup
 		for {
-			ctx, cancel := context.WithTimeout(ctxMain, config.TimeOut*time.Second)
-			//nolint:gomnd
-			wg.Add(2)
-			go fileReader(ctx, cancel, config.Head.Path, &outMessage, &wg)
-			go linesMatcher(ctx, &config, &outMessage, &wg)
-			wg.Wait()
+			select {
+			case <-ctxMain.Done():
+				return
+			default:
+				outMessage.Row = make(chan string)
+				linesMatcher(ctxMain, &config, &outMessage, config.TimeOut)
+			}
 		}
 	}()
 	for {
@@ -122,14 +118,11 @@ func watchSignals(cancel context.CancelFunc, outMessage OutMessage) {
 	cancel()
 }
 
-func fileReader(ctx context.Context, cancel context.CancelFunc, path string, outMessage *OutMessage, wg *sync.WaitGroup) {
-	defer wg.Done()
-	outMessage.Row = make(chan string)
+func fileReader(ctx context.Context, path string, outMessage *OutMessage) {
 	defer close(outMessage.Row)
 	file, err := os.Open(path)
 	if err != nil {
 		outMessage.Err <- fmt.Errorf("file open error: %w", err)
-		cancel()
 		return
 	}
 	defer file.Close()
@@ -138,6 +131,7 @@ func fileReader(ctx context.Context, cancel context.CancelFunc, path string, out
 	for reader.Scan() {
 		select {
 		case <-ctx.Done():
+			outMessage.Err <- ctx.Err()
 			return
 		default:
 			outMessage.Row <- reader.Text()
@@ -145,9 +139,9 @@ func fileReader(ctx context.Context, cancel context.CancelFunc, path string, out
 	}
 }
 
-func linesMatcher(ctx context.Context, config *Config, outMessage *OutMessage, wg *sync.WaitGroup) {
-	defer wg.Done()
+func linesMatcher(ctxParent context.Context, config *Config, outMessage *OutMessage, timeOut time.Duration) {
 	sc := bufio.NewScanner(os.Stdin)
+	var answer string = "y"
 
 	if config.Head.Fields == nil {
 		fmt.Printf(`
@@ -155,18 +149,8 @@ func linesMatcher(ctx context.Context, config *Config, outMessage *OutMessage, w
 Использовать первую строку в файле %s для инициализации полей?
 	
 Нажмите Y(да)/N(нет, завершить)`, config.Head.Path)
-		var answer string = "y"
 		if sc.Scan() {
 			answer = sc.Text()
-		}
-
-		switch answer {
-		case "Y", "y":
-			var str string = <-outMessage.Row
-			config.Head.Fields = csv.GetFields(str, config.Sep)
-			fmt.Println(str)
-		default:
-			return
 		}
 	}
 	fmt.Print("csv_query>> ")
@@ -176,8 +160,20 @@ func linesMatcher(ctx context.Context, config *Config, outMessage *OutMessage, w
 		query = sc.Text()
 		outMessage.Inf <- query
 	}
-	var wgInside sync.WaitGroup
 
+	// nolint:govet
+	ctx, _ := context.WithTimeout(ctxParent, timeOut*time.Second)
+	go fileReader(ctx, config.Head.Path, outMessage)
+
+	switch answer {
+	case "Y", "y":
+		var str string = <-outMessage.Row
+		config.Head.Fields = csv.GetFields(str, config.Sep)
+	default:
+		return
+	}
+
+	var wgInside sync.WaitGroup
 	for val := range outMessage.Row {
 		select {
 		case <-ctx.Done():
@@ -200,23 +196,5 @@ func linesMatcher(ctx context.Context, config *Config, outMessage *OutMessage, w
 	wgInside.Wait()
 }
 
-func pathMatch(config *Config, fs afero.Fs) error {
-	for _, path := range func() []string {
-		paths := make([]string, 0, len(config.OutputPaths)+len(config.ErrorOutputPaths))
-		paths = append(paths, config.OutputPaths...)
-		return append(paths, config.ErrorOutputPaths...)
-	}() {
-		_, err := fs.Stat(path)
-		if err != nil {
-			var file afero.File
-			file, err = fs.Create(path)
-			if err != nil {
-				return fmt.Errorf("%v: %w", err.Error(), file.Close())
-			}
-		}
-	}
-	return nil
-}
-
 // export GIT_COMMIT=$(git rev-list -1 HEAD) && \ go build -ldflags "-X main.GitCommit=$GIT_COMMIT"
-// continent='Asia' and date='2020-04-14'
+// continent='Asia' and date>'2020-04-14'

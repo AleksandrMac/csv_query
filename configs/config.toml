@@ -1,7 +1,8 @@
 sep = ","
-timeOut = 30
-outputPaths = ["logs/access.log"]
-errorOutputPaths = ["logs/error.log"]
+timeOut = 1
+[log]
+    outputPath = "logs/access.log"
+    errorOutputPath = "logs/error.log"
 
 [head]
 path = "test/data/owid-covid-data.csv"
